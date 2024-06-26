@@ -17,9 +17,10 @@ import Base: +, -, *, /, //, \, ^, ImmutableDict
 using ConstructionBase
 using TermInterface
 import TermInterface: iscall, isexpr, head, children,
-                      operation, arguments, metadata, maketerm
+                      operation, arguments, metadata, maketerm, sorted_arguments
 
-export operation, arguments, unsorted_arguments, iscall
+Base.@deprecate istree iscall
+export istree, operation, arguments, sorted_arguments, similarterm, iscall
 # Sym, Term,
 # Add, Mul and Pow
 include("types.jl")

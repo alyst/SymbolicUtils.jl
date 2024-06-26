@@ -1,6 +1,6 @@
 module Code
 
-using StaticArrays, LabelledArrays, SparseArrays, LinearAlgebra, NaNMath, SpecialFunctions
+using StaticArrays, SparseArrays, LinearAlgebra, NaNMath, SpecialFunctions
 
 export toexpr, Assignment, (←), Let, Func, DestructuredArgs, LiteralExpr,
        SetArray, MakeArray, MakeSparseArray, MakeTuple, AtIndex,
@@ -9,7 +9,8 @@ export toexpr, Assignment, (←), Let, Func, DestructuredArgs, LiteralExpr,
 import ..SymbolicUtils
 import ..SymbolicUtils.Rewriters
 import SymbolicUtils: @matchable, BasicSymbolic, Sym, Term, iscall, operation, arguments, issym,
-                      symtype, unsorted_arguments, metadata, isterm, term
+                      symtype, sorted_arguments, metadata, isterm, term, maketerm
+import SymbolicIndexingInterface: symbolic_type, NotSymbolic
 
 ##== state management ==##
 
@@ -124,7 +125,7 @@ end
 function function_to_expr(op::Union{typeof(*),typeof(+)}, O, st)
     out = get(st.rewrites, O, nothing)
     out === nothing || return out
-    args = map(Base.Fix2(toexpr, st), arguments(O))
+    args = map(Base.Fix2(toexpr, st), sorted_arguments(O))
     if length(args) >= 3 && symtype(O) <: Number
         x, xs = Iterators.peel(args)
         foldl(xs, init=x) do a, b
@@ -169,6 +170,14 @@ function substitute_name(O, st)
     end
 end
 
+function _is_array_of_symbolics(O)
+    # O is an array, not a symbolic array, and either has a non-symbolic eltype or contains elements that are
+    # symbolic or arrays of symbolics
+    return O isa AbstractArray && symbolic_type(O) == NotSymbolic() &&
+        (symbolic_type(eltype(O)) != NotSymbolic() ||
+        any(x -> symbolic_type(x) != NotSymbolic() || _is_array_of_symbolics(x), O))
+end
+
 function toexpr(O, st)
     if issym(O)
         O = substitute_name(O, st)
@@ -176,6 +185,9 @@ function toexpr(O, st)
     end
     O = substitute_name(O, st)
 
+    if _is_array_of_symbolics(O)
+        return toexpr(MakeArray(O, typeof(O)), st)
+    end
     !iscall(O) && return O
     op = operation(O)
     expr′ = function_to_expr(op, O, st)
@@ -566,25 +578,6 @@ end
     MArray{Tuple{dims...}, T}(elems...)
 end
 
-## LabelledArrays
-@inline function create_array(A::Type{<:SLArray}, T, nd::Val, d::Val{dims}, elems...) where {dims}
-    a = create_array(SArray, T, nd, d, elems...)
-    if nfields(dims) === ndims(A)
-        similar_type(A, eltype(a), Size(dims))(a)
-    else
-        a
-    end
-end
-
-@inline function create_array(A::Type{<:LArray}, T, nd::Val, d::Val{dims}, elems...) where {dims}
-    data = create_array(Array, T, nd, d, elems...)
-    if nfields(dims) === ndims(A)
-        LArray{eltype(data),nfields(dims),typeof(data),LabelledArrays.symnames(A)}(data)
-    else
-        data
-    end
-end
-
 ## We use a separate type for Sparse Arrays to sidestep the need for
 ## iszero to be defined on the expression type
 @matchable struct MakeSparseArray{S<:AbstractSparseArray}
@@ -744,7 +737,7 @@ end
 function cse_state!(state, t)
     !iscall(t) && return t
     state[t] = Base.get(state, t, 0) + 1
-    foreach(x->cse_state!(state, x), unsorted_arguments(t))
+    foreach(x->cse_state!(state, x), arguments(t))
 end
 
 function cse_block!(assignments, counter, names, name, state, x)
@@ -759,7 +752,7 @@ function cse_block!(assignments, counter, names, name, state, x)
             return sym
         end
     elseif iscall(x)
-        args = map(a->cse_block!(assignments, counter, names, name, state,a), unsorted_arguments(x))
+        args = map(a->cse_block!(assignments, counter, names, name, state,a), arguments(x))
         if isterm(x)
             return term(operation(x), args...)
         else

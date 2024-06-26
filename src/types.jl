@@ -89,7 +89,7 @@ const SIMPLIFIED = 0x01 << 0
 #@inline is_of_type(x::BasicSymbolic, type::UInt8) = (x.bitflags & type) != 0x00
 #@inline issimplified(x::BasicSymbolic) = is_of_type(x, SIMPLIFIED)
 
-function ConstructionBase.setproperties_object(obj::BasicSymbolic{T}, patch)::BasicSymbolic{T} where T
+function ConstructionBase.setproperties(obj::BasicSymbolic{T}, patch::NamedTuple)::BasicSymbolic{T} where T
     nt = getproperties(obj)
     nt_new = merge(nt, patch)
     Unityper.rt_constructor(obj){T}(;nt_new...)
@@ -100,9 +100,10 @@ end
 ###
 
 """
-    symtype(x)
+$(SIGNATURES)
 
-Returns the numeric type of `x`. By default this is just `typeof(x)`.
+Returns the [numeric type](https://docs.julialang.org/en/v1/base/numbers/#Standard-Numeric-Types) 
+of `x`. By default this is just `typeof(x)`.
 Define this for your symbolic types if you want [`SymbolicUtils.simplify`](@ref) to apply rules
 specific to numbers (such as commutativity of multiplication). Or such
 rules that may be implemented in the future.
@@ -126,8 +127,8 @@ end
 
 @inline head(x::BasicSymbolic) = operation(x)
 
-function arguments(x::BasicSymbolic)
-    args = unsorted_arguments(x)
+function TermInterface.sorted_arguments(x::BasicSymbolic)
+    args = arguments(x)
     @compactified x::BasicSymbolic begin
         Add => @goto ADD
         Mul => @goto MUL
@@ -148,9 +149,11 @@ function arguments(x::BasicSymbolic)
     return args
 end
 
-unsorted_arguments(x) = arguments(x)
-children(x::BasicSymbolic) = arguments(x)
-function unsorted_arguments(x::BasicSymbolic)
+@deprecate unsorted_arguments(x) arguments(x)
+
+TermInterface.children(x::BasicSymbolic) = arguments(x)
+TermInterface.sorted_children(x::BasicSymbolic) = sorted_arguments(x)
+function TermInterface.arguments(x::BasicSymbolic)
     @compactified x::BasicSymbolic begin
         Term => return x.arguments
         Add  => @goto ADDMUL
@@ -209,9 +212,7 @@ iscall(s::BasicSymbolic) = isexpr(s)
 Returns `true` if `x` is a `Sym`. If true, `nameof` must be defined
 on `x` and must return a `Symbol`.
 """
-issym(x) = false
-issym(x::BasicSymbolic) = isa_SymType(Val(:Sym), x)
-
+issym(x) = isa_SymType(Val(:Sym), x)
 isterm(x) = isa_SymType(Val(:Term), x)
 ismul(x)  = isa_SymType(Val(:Mul), x)
 isadd(x)  = isa_SymType(Val(:Add), x)
@@ -224,6 +225,8 @@ isdiv(x)  = isa_SymType(Val(:Div), x)
 
 Base.isequal(::Symbolic, x) = false
 Base.isequal(x, ::Symbolic) = false
+Base.isequal(::Symbolic, ::Missing) = false
+Base.isequal(::Missing, ::Symbolic) = false
 Base.isequal(::Symbolic, ::Symbolic) = false
 coeff_isequal(a, b) = isequal(a, b) || ((a isa AbstractFloat || b isa AbstractFloat) && (a==b))
 function _allarequal(xs, ys)::Bool
@@ -555,9 +558,24 @@ end
 unflatten(t) = t
 
 function TermInterface.maketerm(T::Type{<:BasicSymbolic}, head, args, metadata)
-    basicsymbolic(head, args, symtype(T), metadata)
+    st = symtype(T)
+    pst = _promote_symtype(head, args)
+    # Use promoted symtype only if not a subtype of the existing symtype of T.
+    # This is useful when calling `maketerm(BasicSymbolic{Number}, (==), [true, false])` 
+    # Where the result would have a symtype of Bool. 
+    # Please see discussion in https://github.com/JuliaSymbolics/SymbolicUtils.jl/pull/609 
+    # TODO this should be optimized.
+    new_st = if st <: AbstractArray
+        st
+    elseif pst === Bool
+        pst
+    elseif pst === Any || (st === Number && pst <: st)
+        st
+    else
+        pst
+    end
+    basicsymbolic(head, args, new_st, metadata)
 end
-
 
 function basicsymbolic(f, args, stype, metadata)
     if f isa Symbol
@@ -568,14 +586,38 @@ function basicsymbolic(f, args, stype, metadata)
         T = _promote_symtype(f, args)
     end
     if T <: LiteralReal
-        Term{T}(f, args, metadata=metadata)
-    elseif T <: Number && (f in (+, *) || (f in (/, ^) && length(args) == 2)) && all(x->symtype(x) <: Number, args)
-        res = f(args...)
-        if res isa Symbolic
-            @set! res.metadata = metadata
+        @goto FALLBACK
+    elseif all(x->symtype(x) <: Number, args)
+        if f === (+)
+            res = +(args...)
+            if isadd(res) || isterm(res)
+                @set! res.metadata = metadata
+            end
+            res
+        elseif f == (*)
+            res = *(args...)
+            if ismul(res) || isterm(res)
+                @set! res.metadata = metadata
+            end
+            res
+        elseif f == (/)
+            @assert length(args) == 2
+            res = args[1] / args[2]
+            if isdiv(res)
+                @set! res.metadata = metadata
+            end
+            res
+        elseif f == (^) && length(args) == 2
+            res = args[1] ^ args[2]
+            if ispow(res)
+                @set! res.metadata = metadata
+            end
+            res
+        else
+            @goto FALLBACK
         end
-        return res
     else
+        @label FALLBACK
         Term{T}(f, args, metadata=metadata)
     end
 end
@@ -806,7 +848,7 @@ function show_term(io::IO, t)
     end
 
     f = operation(t)
-    args = arguments(t)
+    args = sorted_arguments(t)
     if symtype(t) <: LiteralReal
         show_call(io, f, args)
     elseif f === (+)
@@ -956,10 +998,9 @@ variable. So, `h(1, g)` will fail and `h(1, f)` will work.
 """
 macro syms(xs...)
     defs = map(xs) do x
-        n, t = _name_type(x)
-        T = esc(t)
         nt = _name_type(x)
         n, t = nt.name, nt.type
+        T = esc(t)
         :($(esc(n)) = Sym{$T}($(Expr(:quote, n))))
     end
     Expr(:block, defs...,
